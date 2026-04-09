@@ -38,6 +38,8 @@ extern int ql_capture_usbmon_log(PROFILE_T *profile, const char *log_path);
 extern void ql_stop_usbmon_log(PROFILE_T *profile);
 //UINT ifc_get_addr(const char *ifname);
 static int s_link = -1;
+static void send_signo_to_main(int signo);
+
 static void usbnet_link_change(int link, PROFILE_T *profile) {
     if (s_link == link)
         return;
