@@ -49,17 +49,18 @@ jobs:
         run: |
           cd sdk
           cat > feeds.conf <<EOF
+          src-git base https://github.com/openwrt/openwrt.git;${{ env.OPENWRT_FEED_BRANCH }}
           src-git packages https://github.com/openwrt/packages.git;${{ env.OPENWRT_FEED_BRANCH }}
           src-git luci https://github.com/openwrt/luci.git;${{ env.OPENWRT_FEED_BRANCH }}
           src-git routing https://git.openwrt.org/feed/routing.git;${{ env.OPENWRT_FEED_BRANCH }}
-          src-link qmodem $GITHUB_WORKSPACE/qmodem
           EOF
-          ./scripts/feeds update packages luci routing qmodem
-          ./scripts/feeds install -p packages json-c
-          ./scripts/feeds install -p qmodem ${{ env.PACKAGE_NAME }}
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "src-link qmodem $GITHUB_WORKSPACE/qmodem" >> feeds.conf
+          ./scripts/feeds update qmodem
+          ./scripts/feeds install -a -p qmodem
           echo "CONFIG_ALL=n" > .config
           echo "CONFIG_AUTOREMOVE=n" >> .config
-          echo "CONFIG_PACKAGE_libjson-c=y" >> .config
           echo "CONFIG_PACKAGE_${{ env.PACKAGE_NAME }}=m" >> .config
           make defconfig
 
@@ -67,8 +68,7 @@ jobs:
         run: |
           cd sdk
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          make package/feeds/packages/json-c/compile -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
-          make package/${{ env.PACKAGE_FEED_DIR }}/compile -j1 V=s 2>&1 | tee -a "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
+          make package/${{ env.PACKAGE_FEED_DIR }}/compile -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
 
       - name: Collect build artifacts
         if: always()
