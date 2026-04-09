@@ -55,7 +55,7 @@ jobs:
           src-link qmodem $GITHUB_WORKSPACE/qmodem
           EOF
           ./scripts/feeds update packages luci routing qmodem
-          ./scripts/feeds install -p packages libjson-c
+          ./scripts/feeds install -p packages json-c
           ./scripts/feeds install -p qmodem ${{ env.PACKAGE_NAME }}
           echo "CONFIG_ALL=n" > .config
           echo "CONFIG_AUTOREMOVE=n" >> .config
@@ -67,7 +67,7 @@ jobs:
         run: |
           cd sdk
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          make package/feeds/packages/libjson-c/compile -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
+          make package/feeds/packages/json-c/compile -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
           make package/${{ env.PACKAGE_FEED_DIR }}/compile -j1 V=s 2>&1 | tee -a "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
 
       - name: Collect build artifacts
