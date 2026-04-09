@@ -15,6 +15,10 @@
 ******************************************************************************/
 
 #include "QMIThread.h"
+#include "atchannel.h"
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/utsname.h>
 #include <sys/time.h>
@@ -74,6 +78,441 @@ static int check_ipv4_address(PROFILE_T *profile) {
     }
 
     return 0;
+}
+
+#define USER_PLANE_HEALTHY_PROBE_INTERVAL_MSEC 10000UL
+#define USER_PLANE_DNS_PROBE_TIMEOUT_MSEC 1000
+#define USER_PLANE_SOFT_HEAL_THRESHOLD 2U
+#define USER_PLANE_REDIAL_THRESHOLD 4U
+#define USER_PLANE_RADIO_RESET_THRESHOLD 6U
+#define USER_PLANE_MAX_FALLBACK_DNS 2U
+
+typedef struct {
+    in_addr_t ipv4[USER_PLANE_MAX_FALLBACK_DNS];
+    struct in6_addr ipv6[USER_PLANE_MAX_FALLBACK_DNS];
+    size_t ipv4_count;
+    size_t ipv6_count;
+} dns_probe_targets_t;
+
+static in_addr_t qmi_ipv4_to_be(uint32_t qmi_ip) {
+    return (qmi_ip >> 24) | ((qmi_ip >> 8) & 0xff00) | ((qmi_ip << 8) & 0xff0000) | (qmi_ip << 24);
+}
+
+static int dns_target_exists_v4(const dns_probe_targets_t *targets, in_addr_t addr) {
+    size_t i;
+
+    for (i = 0; i < targets->ipv4_count; i++) {
+        if (targets->ipv4[i] == addr)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int dns_target_exists_v6(const dns_probe_targets_t *targets, const struct in6_addr *addr) {
+    size_t i;
+
+    for (i = 0; i < targets->ipv6_count; i++) {
+        if (!memcmp(&targets->ipv6[i], addr, sizeof(*addr)))
+            return 1;
+    }
+
+    return 0;
+}
+
+static void append_fallback_dns_v4(dns_probe_targets_t *targets, in_addr_t addr) {
+    if (targets->ipv4_count >= USER_PLANE_MAX_FALLBACK_DNS || dns_target_exists_v4(targets, addr))
+        return;
+
+    targets->ipv4[targets->ipv4_count++] = addr;
+}
+
+static void append_fallback_dns_v6(dns_probe_targets_t *targets, const struct in6_addr *addr) {
+    if (targets->ipv6_count >= USER_PLANE_MAX_FALLBACK_DNS || dns_target_exists_v6(targets, addr))
+        return;
+
+    memcpy(&targets->ipv6[targets->ipv6_count++], addr, sizeof(*addr));
+}
+
+static int load_dns_probe_targets_from_udhcpc(const PROFILE_T *profile, dns_probe_targets_t *targets) {
+    size_t i;
+    memset(targets, 0, sizeof(*targets));
+
+    for (i = 0; i < profile->udhcpc_dns4_count; i++) {
+        append_fallback_dns_v4(targets, profile->udhcpc_dns4[i]);
+    }
+
+    for (i = 0; i < profile->udhcpc_dns6_count; i++) {
+        struct in6_addr addr6;
+
+        memcpy(&addr6, profile->udhcpc_dns6[i], sizeof(addr6));
+        append_fallback_dns_v6(targets, &addr6);
+    }
+
+    return (targets->ipv4_count + targets->ipv6_count) > 0;
+}
+
+static size_t build_dns_probe_query(unsigned char *packet, size_t packet_size, uint16_t txid) {
+    unsigned char *ptr = packet;
+    char host[64];
+    char *label = host;
+
+    if (packet_size < 64)
+        return 0;
+
+    memset(packet, 0, packet_size);
+    snprintf(host, sizeof(host), "cm-%04x.google.com", txid);
+
+    packet[0] = (txid >> 8) & 0xFF;
+    packet[1] = txid & 0xFF;
+    packet[2] = 0x01;
+    packet[5] = 0x01;
+    ptr = packet + 12;
+
+    while (*label) {
+        char *dot = strchr(label, '.');
+        size_t len = dot ? (size_t)(dot - label) : strlen(label);
+
+        if (len == 0 || len > 63 || (size_t)(ptr - packet + 1 + len + 5) >= packet_size)
+            return 0;
+
+        *ptr++ = (unsigned char)len;
+        memcpy(ptr, label, len);
+        ptr += len;
+
+        if (dot == NULL)
+            break;
+        label = dot + 1;
+    }
+
+    *ptr++ = 0x00;
+    *ptr++ = 0x00;
+    *ptr++ = 0x01;
+    *ptr++ = 0x00;
+    *ptr++ = 0x01;
+
+    return (size_t)(ptr - packet);
+}
+
+static int probe_dns_socket(int family, const void *src_ip, const void *dst_ip, char *detail, size_t detail_size) {
+    unsigned char query[128];
+    unsigned char reply[512];
+    char ipbuf[INET6_ADDRSTRLEN];
+    struct pollfd pfd;
+    uint16_t txid = (uint16_t)clock_msec();
+    size_t query_len = build_dns_probe_query(query, sizeof(query), txid);
+    int fd = -1;
+    int ret = -1;
+
+    if (detail && detail_size > 0)
+        detail[0] = '\0';
+
+    if (query_len == 0) {
+        if (detail)
+            snprintf(detail, detail_size, "build DNS probe packet failed");
+        return -1;
+    }
+
+    fd = socket(family, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        if (detail)
+            snprintf(detail, detail_size, "socket failed: %s", strerror(errno));
+        return -1;
+    }
+
+    if (family == AF_INET) {
+        struct sockaddr_in local_addr;
+        struct sockaddr_in remote_addr;
+
+        memset(&local_addr, 0, sizeof(local_addr));
+        memset(&remote_addr, 0, sizeof(remote_addr));
+        local_addr.sin_family = AF_INET;
+        remote_addr.sin_family = AF_INET;
+        local_addr.sin_addr.s_addr = *(const in_addr_t *)src_ip;
+        remote_addr.sin_addr.s_addr = *(const in_addr_t *)dst_ip;
+        remote_addr.sin_port = htons(53);
+
+        inet_ntop(AF_INET, &remote_addr.sin_addr, ipbuf, sizeof(ipbuf));
+        if (bind(fd, (const struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+            if (detail)
+                snprintf(detail, detail_size, "dns:%s bind failed: %s", ipbuf, strerror(errno));
+            goto out;
+        }
+        if (connect(fd, (const struct sockaddr *)&remote_addr, sizeof(remote_addr)) < 0) {
+            if (detail)
+                snprintf(detail, detail_size, "dns:%s connect failed: %s", ipbuf, strerror(errno));
+            goto out;
+        }
+    } else {
+        struct sockaddr_in6 local_addr6;
+        struct sockaddr_in6 remote_addr6;
+
+        memset(&local_addr6, 0, sizeof(local_addr6));
+        memset(&remote_addr6, 0, sizeof(remote_addr6));
+        local_addr6.sin6_family = AF_INET6;
+        remote_addr6.sin6_family = AF_INET6;
+        memcpy(&local_addr6.sin6_addr, src_ip, sizeof(local_addr6.sin6_addr));
+        memcpy(&remote_addr6.sin6_addr, dst_ip, sizeof(remote_addr6.sin6_addr));
+        remote_addr6.sin6_port = htons(53);
+
+        inet_ntop(AF_INET6, &remote_addr6.sin6_addr, ipbuf, sizeof(ipbuf));
+        if (bind(fd, (const struct sockaddr *)&local_addr6, sizeof(local_addr6)) < 0) {
+            if (detail)
+                snprintf(detail, detail_size, "dns:%s bind failed: %s", ipbuf, strerror(errno));
+            goto out;
+        }
+        if (connect(fd, (const struct sockaddr *)&remote_addr6, sizeof(remote_addr6)) < 0) {
+            if (detail)
+                snprintf(detail, detail_size, "dns:%s connect failed: %s", ipbuf, strerror(errno));
+            goto out;
+        }
+    }
+
+    if (send(fd, query, query_len, 0) < 0) {
+        if (detail)
+            snprintf(detail, detail_size, "dns:%s send failed: %s", ipbuf, strerror(errno));
+        goto out;
+    }
+
+    memset(&pfd, 0, sizeof(pfd));
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    ret = poll(&pfd, 1, USER_PLANE_DNS_PROBE_TIMEOUT_MSEC);
+    if (ret <= 0) {
+        if (detail)
+            snprintf(detail, detail_size, "dns:%s timeout", ipbuf);
+        goto out;
+    }
+
+    ret = recv(fd, reply, sizeof(reply), 0);
+    if (ret < 12) {
+        if (detail)
+            snprintf(detail, detail_size, "dns:%s short response", ipbuf);
+        goto out;
+    }
+
+    if ((((uint16_t)reply[0] << 8) | reply[1]) != txid) {
+        if (detail)
+            snprintf(detail, detail_size, "dns:%s txid mismatch", ipbuf);
+        goto out;
+    }
+
+    if ((((uint16_t)reply[2] << 8) | reply[3]) & 0x8000) {
+        if (detail)
+            snprintf(detail, detail_size, "dns:%s", ipbuf);
+        ret = 0;
+        goto out;
+    }
+
+    if (detail)
+        snprintf(detail, detail_size, "dns:%s non-response packet", ipbuf);
+
+out:
+    if (fd >= 0)
+        close(fd);
+    return ret;
+}
+
+static int probe_user_plane(PROFILE_T *profile, char *detail, size_t detail_size) {
+    dns_probe_targets_t fallback_dns;
+    int has_target = 0;
+    size_t i;
+
+    if (detail && detail_size > 0)
+        detail[0] = '\0';
+
+    if (profile->enable_ipv4 && profile->ipv4.Address && profile->ipv4.DnsPrimary) {
+        in_addr_t src_ip = qmi_ipv4_to_be(profile->ipv4.Address);
+        in_addr_t dst_ip = qmi_ipv4_to_be(profile->ipv4.DnsPrimary);
+        has_target = 1;
+        if (probe_dns_socket(AF_INET, &src_ip, &dst_ip, detail, detail_size) == 0)
+            return 0;
+    }
+
+    if (profile->enable_ipv4 && profile->ipv4.Address && profile->ipv4.DnsSecondary && profile->ipv4.DnsSecondary != profile->ipv4.DnsPrimary) {
+        in_addr_t src_ip = qmi_ipv4_to_be(profile->ipv4.Address);
+        in_addr_t dst_ip = qmi_ipv4_to_be(profile->ipv4.DnsSecondary);
+        has_target = 1;
+        if (probe_dns_socket(AF_INET, &src_ip, &dst_ip, detail, detail_size) == 0)
+            return 0;
+    }
+
+    if (profile->enable_ipv6 && profile->ipv6.Address[0] && profile->ipv6.DnsPrimary[0]) {
+        has_target = 1;
+        if (probe_dns_socket(AF_INET6, profile->ipv6.Address, profile->ipv6.DnsPrimary, detail, detail_size) == 0)
+            return 0;
+    }
+
+    if (profile->enable_ipv6 && profile->ipv6.Address[0] && profile->ipv6.DnsSecondary[0]
+        && memcmp(profile->ipv6.DnsSecondary, profile->ipv6.DnsPrimary, sizeof(profile->ipv6.DnsPrimary))) {
+        has_target = 1;
+        if (probe_dns_socket(AF_INET6, profile->ipv6.Address, profile->ipv6.DnsSecondary, detail, detail_size) == 0)
+            return 0;
+    }
+
+    if (!has_target) {
+        if (load_dns_probe_targets_from_udhcpc(profile, &fallback_dns)) {
+            for (i = 0; i < fallback_dns.ipv4_count; i++) {
+                in_addr_t src_ip = qmi_ipv4_to_be(profile->ipv4.Address);
+                if (profile->enable_ipv4 && profile->ipv4.Address) {
+                    has_target = 1;
+                    if (probe_dns_socket(AF_INET, &src_ip, &fallback_dns.ipv4[i], detail, detail_size) == 0)
+                        return 0;
+                }
+            }
+
+            for (i = 0; i < fallback_dns.ipv6_count; i++) {
+                if (profile->enable_ipv6 && profile->ipv6.Address[0]) {
+                    has_target = 1;
+                    if (probe_dns_socket(AF_INET6, profile->ipv6.Address, &fallback_dns.ipv6[i], detail, detail_size) == 0)
+                        return 0;
+                }
+            }
+        }
+    }
+
+    if (!has_target) {
+        if (detail)
+            snprintf(detail, detail_size, "no dns targets");
+        return -1;
+    }
+
+    return -1;
+}
+
+static void delay_user_plane_probe(PROFILE_T *profile) {
+    profile->last_user_plane_probe_at = clock_msec();
+}
+
+static void reset_user_plane_probe(PROFILE_T *profile, int clear_failures) {
+    if (clear_failures)
+        profile->user_plane_failures = 0;
+    profile->last_user_plane_probe_at = 0;
+}
+
+static int should_probe_user_plane(PROFILE_T *profile) {
+    unsigned long now = clock_msec();
+
+    if (profile->user_plane_failures > 0)
+        return 1;
+    if (profile->last_user_plane_probe_at == 0) {
+        profile->last_user_plane_probe_at = now;
+        return 0;
+    }
+
+    return (now - profile->last_user_plane_probe_at) >= USER_PLANE_HEALTHY_PROBE_INTERVAL_MSEC;
+}
+
+static void soft_heal_user_plane(PROFILE_T *profile, const struct request_ops *request_ops,
+        UCHAR IPv4ConnectionStatus, UCHAR IPv6ConnectionStatus) {
+    if (request_ops->requestGetIPAddress == NULL)
+        return;
+
+    if (profile->enable_ipv4 && IPv4ConnectionStatus == QWDS_PKT_DATA_CONNECTED)
+        request_ops->requestGetIPAddress(profile, IpFamilyV4);
+    if (profile->enable_ipv6 && IPv6ConnectionStatus == QWDS_PKT_DATA_CONNECTED)
+        request_ops->requestGetIPAddress(profile, IpFamilyV6);
+
+    udhcpc_start(profile);
+}
+
+static void force_user_plane_redial(PROFILE_T *profile, const struct request_ops *request_ops,
+        UCHAR *IPv4ConnectionStatus, UCHAR *IPv6ConnectionStatus, unsigned long *SetupCallAllowTime) {
+    dbg_time("Forcing redial after repeated user-plane probe failures");
+
+    if (profile->enable_ipv4 && *IPv4ConnectionStatus == QWDS_PKT_DATA_CONNECTED)
+        request_ops->requestDeactivateDefaultPDP(profile, IpFamilyV4);
+    if (profile->enable_ipv6 && *IPv6ConnectionStatus == QWDS_PKT_DATA_CONNECTED) {
+        if (!(profile->enable_ipv4 && profile->request_ops != &qmi_request_ops))
+            request_ops->requestDeactivateDefaultPDP(profile, IpFamilyV6);
+    }
+
+    *IPv4ConnectionStatus = QWDS_PKT_DATA_DISCONNECTED;
+    *IPv6ConnectionStatus = QWDS_PKT_DATA_DISCONNECTED;
+    reset_user_plane_probe(profile, 1);
+    if (SetupCallAllowTime)
+        *SetupCallAllowTime = clock_msec() + 1000;
+    usbnet_link_change(0, profile);
+    send_signo_to_main(SIG_EVENT_START);
+}
+
+static int perform_radio_reset(PROFILE_T *profile, const struct request_ops *request_ops) {
+    (void)profile;
+
+    if (request_ops == &atc_request_ops) {
+        int err;
+
+        dbg_time("radio reset via AT CFUN");
+        err = at_send_command("AT+CFUN=0", NULL);
+        if (err)
+            return err;
+        sleep(1);
+        return at_send_command("AT+CFUN=1", NULL);
+    }
+
+    if (request_ops && request_ops->requestRadioPower) {
+        int err;
+
+        dbg_time("radio reset via QMI requestRadioPower");
+        err = request_ops->requestRadioPower(0);
+        if (err)
+            return err;
+        sleep(1);
+        return request_ops->requestRadioPower(1);
+    }
+
+    dbg_time("radio reset is unavailable on current backend");
+    return -1;
+}
+
+static void user_plane_radio_reset(PROFILE_T *profile, const struct request_ops *request_ops,
+        UCHAR *IPv4ConnectionStatus, UCHAR *IPv6ConnectionStatus, UCHAR *PSAttachedState,
+        unsigned long *SetupCallAllowTime) {
+    if (perform_radio_reset(profile, request_ops) != 0) {
+        dbg_time("user-plane probe wants radio reset but backend reset failed");
+        return;
+    }
+
+    *IPv4ConnectionStatus = QWDS_PKT_DATA_DISCONNECTED;
+    *IPv6ConnectionStatus = QWDS_PKT_DATA_DISCONNECTED;
+    if (PSAttachedState)
+        *PSAttachedState = 0;
+    reset_user_plane_probe(profile, 1);
+    if (SetupCallAllowTime)
+        *SetupCallAllowTime = clock_msec() + 1000;
+    usbnet_link_change(0, profile);
+    send_signo_to_main(SIG_EVENT_START);
+}
+
+static void check_user_plane_health(PROFILE_T *profile, const struct request_ops *request_ops,
+        UCHAR *IPv4ConnectionStatus, UCHAR *IPv6ConnectionStatus, UCHAR *PSAttachedState,
+        unsigned long *SetupCallAllowTime) {
+    char detail[128];
+    unsigned failures;
+
+    if (!should_probe_user_plane(profile))
+        return;
+
+    delay_user_plane_probe(profile);
+    if (probe_user_plane(profile, detail, sizeof(detail)) == 0) {
+        if (profile->user_plane_failures > 0)
+            dbg_time("User-plane probe restored via %s", detail[0] ? detail : "dns target");
+        profile->user_plane_failures = 0;
+        return;
+    }
+
+    profile->user_plane_failures++;
+    failures = profile->user_plane_failures;
+    dbg_time("User-plane probe failed (%u): %s", failures, detail[0] ? detail : "probe failed");
+
+    if (failures == USER_PLANE_SOFT_HEAL_THRESHOLD) {
+        soft_heal_user_plane(profile, request_ops, *IPv4ConnectionStatus, *IPv6ConnectionStatus);
+        dbg_time("Applied soft heal after repeated user-plane probe failures");
+    } else if (failures == USER_PLANE_REDIAL_THRESHOLD) {
+        force_user_plane_redial(profile, request_ops, IPv4ConnectionStatus, IPv6ConnectionStatus, SetupCallAllowTime);
+    } else if (failures >= USER_PLANE_RADIO_RESET_THRESHOLD) {
+        user_plane_radio_reset(profile, request_ops, IPv4ConnectionStatus, IPv6ConnectionStatus, PSAttachedState, SetupCallAllowTime);
+    }
 }
 
 static void main_send_event_to_qmidevice(int triger_event) {
@@ -235,6 +674,14 @@ static void ql_sigaction(int signo) {
     }
 }
 
+static int maybe_do_radio_reset(PROFILE_T *profile, const struct request_ops *request_ops, unsigned setup_call_fail) {
+    if (setup_call_fail != 3 || request_ops == NULL)
+        return 0;
+
+    dbg_time("dial failed %u times continuously, try radio reset for self-recovery", setup_call_fail);
+    return perform_radio_reset(profile, request_ops) == 0;
+}
+
 static int usage(const char *progname) {
     dbg_time("Usage: %s [options]", progname);
     dbg_time("-s [apn [user password auth]]          Set apn/user/password/auth get from your network provider. auth: 1~pap, 2~chap, 3~MsChapV2");
@@ -391,10 +838,7 @@ static int qmi_main(PROFILE_T *profile)
     if (request_ops->requestSetProfile && (profile->apn || profile->user || profile->password)) {
         if (request_ops->requestSetProfile(profile) == 1) {
 #ifdef REBOOT_SIM_CARD_WHEN_APN_CHANGE //enable at only when customer asked 
-            if (request_ops->requestRadioPower) {
-                request_ops->requestRadioPower(0);
-                request_ops->requestRadioPower(1);
-            }
+            perform_radio_reset(profile, request_ops);
 #endif
         }
     }
@@ -422,7 +866,7 @@ static int qmi_main(PROFILE_T *profile)
         int ne, ret, nevents = sizeof(pollfds)/sizeof(pollfds[0]);
 
         do {
-            ret = poll(pollfds, nevents,  15*1000);
+            ret = poll(pollfds, nevents,  5*1000);
         } while ((ret < 0) && (errno == EINTR));
 
         if (ret == 0)
@@ -507,19 +951,27 @@ static int qmi_main(PROFILE_T *profile)
                             if ((profile->enable_ipv4 && IPv4ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED)
                                     || (profile->enable_ipv6 && IPv6ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED)) {
                                 const unsigned allow_time[] = {5, 10, 20, 40, 60};
+                                int did_radio_reset = 0;
 
                                 if (SetupCallFail < (sizeof(allow_time)/sizeof(unsigned)))
                                     SetupCallAllowTime = allow_time[SetupCallFail];
                                 else
                                     SetupCallAllowTime = 60;
                                 SetupCallFail++;
+                                did_radio_reset = maybe_do_radio_reset(profile, request_ops, SetupCallFail);
                                 dbg_time("try to requestSetupDataCall %ld second later", SetupCallAllowTime);
                                 alarm(SetupCallAllowTime);
                                 SetupCallAllowTime = SetupCallAllowTime*1000 + clock_msec();
+                                if (did_radio_reset) {
+                                    PSAttachedState = 0;
+                                    dbg_time("radio reset completed, waiting for modem registration before next dial");
+                                }
                             }
                             else if (IPv4ConnectionStatus ==  QWDS_PKT_DATA_CONNECTED || IPv6ConnectionStatus ==  QWDS_PKT_DATA_CONNECTED) {
                                 SetupCallFail = 0;
                                 SetupCallAllowTime = clock_msec();
+                                profile->user_plane_failures = 0;
+                                delay_user_plane_probe(profile);
                             }
                         break;
 
@@ -550,10 +1002,7 @@ static int qmi_main(PROFILE_T *profile)
                                     PsAttachTime = clock_msec();
                                     PsAttachFail++;
 
-                                    if (request_ops->requestRadioPower) {
-                                        request_ops->requestRadioPower(0);
-                                        request_ops->requestRadioPower(1);
-                                    }
+                                    perform_radio_reset(profile, request_ops);
                                 }
                             }
 #endif
@@ -591,6 +1040,7 @@ static int qmi_main(PROFILE_T *profile)
                             }
 
                             if (IPv4ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED && IPv6ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED) {
+                                reset_user_plane_probe(profile, 1);
                                 usbnet_link_change(0, profile);
                             }
                             else if (IPv4ConnectionStatus ==  QWDS_PKT_DATA_CONNECTED || IPv6ConnectionStatus ==  QWDS_PKT_DATA_CONNECTED) {
@@ -600,6 +1050,8 @@ static int qmi_main(PROFILE_T *profile)
                                 if (IPv6ConnectionStatus == QWDS_PKT_DATA_CONNECTED)
                                     link |= (1<<IpFamilyV6);
                                 usbnet_link_change(link, profile);
+                                check_user_plane_health(profile, request_ops, &IPv4ConnectionStatus, &IPv6ConnectionStatus,
+                                    &PSAttachedState, &SetupCallAllowTime);
                             }
                             
                             if ((profile->enable_ipv4 && IPv4ConnectionStatus ==  QWDS_PKT_DATA_DISCONNECTED)
@@ -609,6 +1061,7 @@ static int qmi_main(PROFILE_T *profile)
                         break;
 
                         case SIG_EVENT_STOP:
+                            reset_user_plane_probe(profile, 1);
                             if (profile->enable_ipv4 && IPv4ConnectionStatus ==  QWDS_PKT_DATA_CONNECTED) {
                                 request_ops->requestDeactivateDefaultPDP(profile, IpFamilyV4);
                             }
@@ -637,6 +1090,7 @@ static int qmi_main(PROFILE_T *profile)
                 if (read(fd, &triger_event, sizeof(triger_event)) == sizeof(triger_event)) {
                     switch (triger_event) {
                         case RIL_INDICATE_DEVICE_DISCONNECTED:
+                            reset_user_plane_probe(profile, 1);
                             usbnet_link_change(0, profile);                            
                             goto __main_quit;
                         break;

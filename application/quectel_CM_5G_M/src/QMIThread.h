@@ -228,6 +228,10 @@ typedef struct __PROFILE {
 #endif
     int wda_client;
     uint32_t udhcpc_ip;
+    uint32_t udhcpc_dns4[2];
+    UCHAR udhcpc_dns6[2][16];
+    UCHAR udhcpc_dns4_count;
+    UCHAR udhcpc_dns6_count;
     IPV4_T ipv4;
     IPV6_T ipv6;
     UINT PCSCFIpv4Addr1;
@@ -257,6 +261,8 @@ typedef struct __PROFILE {
     const struct qmi_device_ops *qmi_ops;
     const struct request_ops *request_ops;
     RMNET_INFO rmnet_info;
+    unsigned user_plane_failures;
+    unsigned long last_user_plane_probe_at;
 } PROFILE_T;
 
 #ifdef QUECTEL_QMI_MERGE

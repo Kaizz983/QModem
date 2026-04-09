@@ -35,6 +35,87 @@ static int ql_system(const char *shell_cmd) {
     return system(shell_cmd);
 }
 
+typedef struct {
+    PROFILE_T *profile;
+    char *cmd;
+} udhcpc_thread_arg_t;
+
+static void reset_udhcpc_dns_cache(PROFILE_T *profile) {
+    memset(profile->udhcpc_dns4, 0, sizeof(profile->udhcpc_dns4));
+    memset(profile->udhcpc_dns6, 0, sizeof(profile->udhcpc_dns6));
+    profile->udhcpc_dns4_count = 0;
+    profile->udhcpc_dns6_count = 0;
+}
+
+static int udhcpc_dns_exists_v4(const PROFILE_T *profile, uint32_t addr) {
+    UCHAR i;
+
+    for (i = 0; i < profile->udhcpc_dns4_count; i++) {
+        if (profile->udhcpc_dns4[i] == addr)
+            return 1;
+    }
+
+    return 0;
+}
+
+static int udhcpc_dns_exists_v6(const PROFILE_T *profile, const struct in6_addr *addr) {
+    UCHAR i;
+
+    for (i = 0; i < profile->udhcpc_dns6_count; i++) {
+        if (!memcmp(profile->udhcpc_dns6[i], addr, sizeof(*addr)))
+            return 1;
+    }
+
+    return 0;
+}
+
+static void cache_udhcpc_dns(PROFILE_T *profile, const char *addrstr) {
+    struct in_addr addr4;
+    struct in6_addr addr6;
+
+    if (inet_pton(AF_INET, addrstr, &addr4) == 1) {
+        if (profile->udhcpc_dns4_count < 2 && !udhcpc_dns_exists_v4(profile, addr4.s_addr))
+            profile->udhcpc_dns4[profile->udhcpc_dns4_count++] = addr4.s_addr;
+        return;
+    }
+
+    if (inet_pton(AF_INET6, addrstr, &addr6) == 1) {
+        if (profile->udhcpc_dns6_count < 2 && !udhcpc_dns_exists_v6(profile, &addr6))
+            memcpy(profile->udhcpc_dns6[profile->udhcpc_dns6_count++], &addr6, sizeof(addr6));
+    }
+}
+
+static void parse_udhcpc_output_line(PROFILE_T *profile, const char *line) {
+    const char *dns;
+    char addr[INET6_ADDRSTRLEN];
+
+    dns = strstr(line, "Adding DNS ");
+    if (dns == NULL)
+        return;
+
+    dns += strlen("Adding DNS ");
+    if (sscanf(dns, "%45s", addr) != 1)
+        return;
+
+    cache_udhcpc_dns(profile, addr);
+}
+
+static udhcpc_thread_arg_t *create_udhcpc_thread_arg(PROFILE_T *profile, const char *cmd) {
+    udhcpc_thread_arg_t *arg = calloc(1, sizeof(*arg));
+
+    if (arg == NULL)
+        return NULL;
+
+    arg->cmd = strdup(cmd);
+    if (arg->cmd == NULL) {
+        free(arg);
+        return NULL;
+    }
+
+    arg->profile = profile;
+    return arg;
+}
+
 static void ifc_init_ifr(const char *name, struct ifreq *ifr)
 {
     memset(ifr, 0, sizeof(struct ifreq));
@@ -158,15 +239,21 @@ static int ql_raw_ip_mode_check(const char *ifname, uint32_t ip) {
 }
 
 static void* udhcpc_thread_function(void* arg) {
+    udhcpc_thread_arg_t *thread_arg = (udhcpc_thread_arg_t *)arg;
     FILE * udhcpc_fp;
-    char *udhcpc_cmd = (char *)arg;
+    char *udhcpc_cmd;
+    PROFILE_T *profile;
 
-    if (udhcpc_cmd == NULL)
+    if (thread_arg == NULL)
         return NULL;
+
+    udhcpc_cmd = thread_arg->cmd;
+    profile = thread_arg->profile;
 
     dbg_time("%s", udhcpc_cmd);
     udhcpc_fp = popen(udhcpc_cmd, "r");
     free(udhcpc_cmd);
+    free(thread_arg);
     if (udhcpc_fp) {
         char buf[0xff];
 
@@ -174,6 +261,8 @@ static void* udhcpc_thread_function(void* arg) {
         while((fgets(buf, sizeof(buf)-1, udhcpc_fp)) != NULL) {
             if ((strlen(buf) > 1) && (buf[strlen(buf) - 1] == '\n'))
                 buf[strlen(buf) - 1] = '\0';
+            if (profile)
+                parse_udhcpc_output_line(profile, buf);
             dbg_time("%s", buf);
         }
 
@@ -480,6 +569,7 @@ void udhcpc_start(PROFILE_T *profile) {
     char *ifname = profile->usbnet_adapter;
 
     ql_set_driver_link_state(profile, 1);
+    reset_udhcpc_dns_cache(profile);
 
     if (profile->qmapnet_adapter[0]) {
         ifname = profile->qmapnet_adapter;
@@ -576,11 +666,21 @@ void udhcpc_start(PROFILE_T *profile) {
 #endif
 
 #ifdef USE_DHCLIENT            
-            pthread_create(&udhcpc_thread_id, &udhcpc_thread_attr, udhcpc_thread_function, (void*)strdup(udhcpc_cmd));
-            sleep(1);
+            {
+                udhcpc_thread_arg_t *thread_arg = create_udhcpc_thread_arg(profile, udhcpc_cmd);
+                if (thread_arg) {
+                    pthread_create(&udhcpc_thread_id, &udhcpc_thread_attr, udhcpc_thread_function, thread_arg);
+                    sleep(1);
+                }
+            }
 #else
-            pthread_create(&udhcpc_thread_id, NULL, udhcpc_thread_function, (void*)strdup(udhcpc_cmd));
-            pthread_join(udhcpc_thread_id, NULL);
+            {
+                udhcpc_thread_arg_t *thread_arg = create_udhcpc_thread_arg(profile, udhcpc_cmd);
+                if (thread_arg) {
+                    pthread_create(&udhcpc_thread_id, NULL, udhcpc_thread_function, thread_arg);
+                    pthread_join(udhcpc_thread_id, NULL);
+                }
+            }
             if (profile->request_ops == &atc_request_ops) {
                 profile->udhcpc_ip = 0;
                 ifc_get_addr(ifname, &profile->udhcpc_ip);
@@ -598,8 +698,11 @@ void udhcpc_start(PROFILE_T *profile) {
             }
 
             if (ql_raw_ip_mode_check(ifname, profile->ipv4.Address)) {
-                pthread_create(&udhcpc_thread_id, NULL, udhcpc_thread_function, (void*)strdup(udhcpc_cmd));
-                pthread_join(udhcpc_thread_id, NULL);
+                udhcpc_thread_arg_t *thread_arg = create_udhcpc_thread_arg(profile, udhcpc_cmd);
+                if (thread_arg) {
+                    pthread_create(&udhcpc_thread_id, NULL, udhcpc_thread_function, thread_arg);
+                    pthread_join(udhcpc_thread_id, NULL);
+                }
             }
 
             if (!ql_netcard_ipv4_address_check(ifname, qmi2addr(profile->ipv4.Address))) {
@@ -703,7 +806,11 @@ set_ipv6:
         dibbler_client_alive++;
 #endif
 
-        pthread_create(&udhcpc_thread_id, &udhcpc_thread_attr, udhcpc_thread_function, (void*)strdup(udhcpc_cmd));
+        {
+            udhcpc_thread_arg_t *thread_arg = create_udhcpc_thread_arg(profile, udhcpc_cmd);
+            if (thread_arg)
+                pthread_create(&udhcpc_thread_id, &udhcpc_thread_attr, udhcpc_thread_function, thread_arg);
+        }
 #endif
     }
 }
@@ -729,6 +836,7 @@ void udhcpc_stop(PROFILE_T *profile) {
         dibbler_client_alive = 0;
     }
 
+    reset_udhcpc_dns_cache(profile);
     profile->udhcpc_ip = 0;
 //it seems when call netif_carrier_on(), and netcard 's IP is "0.0.0.0", will cause netif_queue_stopped()
     if (!access("/sbin/ip", X_OK))
