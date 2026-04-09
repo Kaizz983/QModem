@@ -59,6 +59,7 @@ jobs:
           ./scripts/feeds install -p qmodem ${{ env.PACKAGE_NAME }}
           echo "CONFIG_ALL=n" > .config
           echo "CONFIG_AUTOREMOVE=n" >> .config
+          echo "CONFIG_PACKAGE_libjson-c=y" >> .config
           echo "CONFIG_PACKAGE_${{ env.PACKAGE_NAME }}=m" >> .config
           make defconfig
 
@@ -66,7 +67,8 @@ jobs:
         run: |
           cd sdk
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          make package/${{ env.PACKAGE_FEED_DIR }}/compile -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
+          make package/feeds/packages/libjson-c/compile -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
+          make package/${{ env.PACKAGE_FEED_DIR }}/compile -j1 V=s 2>&1 | tee -a "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
 
       - name: Collect build artifacts
         if: always()
