@@ -11,6 +11,7 @@ env:
   SDK_ARCH: aarch64_cortex-a53
   OPENWRT_FEED_BRANCH: openwrt-23.05
   PACKAGE_NAME: quectel-CM-5G-M
+  PACKAGE_FEED_DIR: quectel_CM_5G_M
 
 jobs:
   build:
@@ -54,6 +55,7 @@ jobs:
           src-link qmodem $GITHUB_WORKSPACE/qmodem
           EOF
           ./scripts/feeds update packages luci routing qmodem
+          ./scripts/feeds install -p packages libjson-c
           ./scripts/feeds install -p qmodem ${{ env.PACKAGE_NAME }}
           echo "CONFIG_ALL=n" > .config
           echo "CONFIG_AUTOREMOVE=n" >> .config
@@ -64,7 +66,7 @@ jobs:
         run: |
           cd sdk
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          make package/${{ env.PACKAGE_NAME }}/compile -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
+          make package/${{ env.PACKAGE_FEED_DIR }}/compile -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/artifacts/quectel-CM-M-build.log"
 
       - name: Collect build artifacts
         if: always()
